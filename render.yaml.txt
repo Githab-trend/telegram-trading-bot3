@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: telegram-trading-bot
+    env: python
+    plan: starter   # եթե վճարովի ես, "starter"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python pocket-option.py"
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: API_KEY
+        sync: false
+
+
+
