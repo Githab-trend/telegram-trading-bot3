@@ -29,13 +29,25 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ========= Telegram Bot Setup =========
-bot_token = os.getenv("TELEGRAM_TOKEN")         # <- չհարդքոդես
-chat_id   = os.getenv("CHAT_ID")                                 # <- Քո channel/group/chat id-ը (կամ քո user id)
-bot = telebot.TeleBot(bot_token, parse_mode="HTML")
+def getenv_strict(name: str) -> str:
+    v = os.getenv(name)
+    if v is None:
+        print(f"❌ ENV ERROR: {name} չի գտնվել")
+        sys.exit(1)
+    v = v.strip()
+    if not v:
+        print(f"❌ ENV ERROR: {name} դատարկ է")
+        sys.exit(1)
+    return v
 
-if not bot_token or not chat_id:
-    print("❌ ENV ERROR: BOT_TOKEN կամ CHAT_ID չի գտնվել")
-    sys.exit(1)
+BOT_TOKEN = getenv_strict("BOT_TOKEN")
+CHAT_ID   = getenv_strict("CHAT_ID")
+
+# օպցիոնալ՝ շտապ debug, առանց գաղտնիք բացելու
+print(f"ENV OK: BOT_TOKEN len={len(BOT_TOKEN)}, CHAT_ID set")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+chat_id = CHAT_ID
 
 # ========= Runtime Config (editable via /set) =========
 CFG = {
@@ -498,5 +510,6 @@ if __name__ == "__main__":
     start_checker_thread()
 
     start_polling_forever()
+
 
 
