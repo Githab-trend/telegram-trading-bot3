@@ -29,8 +29,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ========= Telegram Bot Setup =========
-bot_token = '8100566090:AAGky2qeO6yif0vDjnP7NX-AFZ07FEZgs6w'
-chat_id = '-1002794962661'                                  # <- Քո channel/group/chat id-ը (կամ քո user id)
+bot_token = os.getenv("TELEGRAM_TOKEN")         # <- չհարդքոդես
+chat_id   = os.getenv("CHAT_ID")                                 # <- Քո channel/group/chat id-ը (կամ քո user id)
 bot = telebot.TeleBot(bot_token, parse_mode="HTML")
 
 # ========= Runtime Config (editable via /set) =========
@@ -492,4 +492,5 @@ def start_polling_forever():
 # ========= Main =========
 if __name__ == "__main__":
     start_checker_thread()
+
     start_polling_forever()
