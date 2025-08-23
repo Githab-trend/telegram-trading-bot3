@@ -22,7 +22,7 @@ import threading
 import requests
 import io
 import traceback
-import os
+import os, sys
 from datetime import datetime, timezone
 import matplotlib
 matplotlib.use("Agg")
@@ -34,7 +34,8 @@ chat_id   = os.getenv("CHAT_ID")                                 # <- Քո chann
 bot = telebot.TeleBot(bot_token, parse_mode="HTML")
 
 if not bot_token or not chat_id:
-    raise RuntimeError("Set TELEGRAM_TOKEN and CHAT_ID env vars")
+    print("❌ ENV ERROR: BOT_TOKEN կամ CHAT_ID չի գտնվել")
+    sys.exit(1)
 
 # ========= Runtime Config (editable via /set) =========
 CFG = {
@@ -497,4 +498,5 @@ if __name__ == "__main__":
     start_checker_thread()
 
     start_polling_forever()
+
 
