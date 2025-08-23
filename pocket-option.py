@@ -33,6 +33,9 @@ bot_token = os.getenv("TELEGRAM_TOKEN")         # <- չհարդքոդես
 chat_id   = os.getenv("CHAT_ID")                                 # <- Քո channel/group/chat id-ը (կամ քո user id)
 bot = telebot.TeleBot(bot_token, parse_mode="HTML")
 
+if not bot_token or not chat_id:
+    raise RuntimeError("Set TELEGRAM_TOKEN and CHAT_ID env vars")
+
 # ========= Runtime Config (editable via /set) =========
 CFG = {
     # Markets
@@ -494,3 +497,4 @@ if __name__ == "__main__":
     start_checker_thread()
 
     start_polling_forever()
+
