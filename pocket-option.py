@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Full PRO Telegram Signal Bot (Binance spot klines)
-Features:
-- Dynamic Volume & Volatility filters (not hard-coded; rolling stats–based)
-- Multi-confirmation: at least N of {EMA trend, MACD side, RSI(50)} must agree
+Full PRO Telegram Signal Bot
+Sources:
+- Crypto (Binance spot klines)
+- FX (Alpha Vantage intraday)  ← optional; set ALPHAVANTAGE_KEY env to enable
+
+Keeps your existing logic:
+- Dynamic Volume & Volatility filters (rolling stats)
+- Multi-confirmation: need N of {EMA trend, MACD side, RSI(50)}
 - Confidence score + per-indicator breakdown
 - Persist bars filter
 - Cooldown + min-price-move gating (per symbol)
@@ -11,7 +15,7 @@ Features:
 - Per-symbol signal history (last 5)
 - Self-healing polling (auto-reconnect on network errors)
 - Admin commands: /set, /status, /ping
-- Optional chart sending with EMAs (toggleable)
+- Optional chart sending with EMAs
 """
 
 import time
@@ -22,37 +26,28 @@ import threading
 import requests
 import io
 import traceback
-import os, sys
+import os
 from datetime import datetime, timezone
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ========= Telegram Bot Setup =========
-def getenv_strict(name: str) -> str:
-    v = os.getenv(name)
-    if v is None:
-        print(f"❌ ENV ERROR: {name} չի գտնվել")
-        sys.exit(1)
-    v = v.strip()
-    if not v:
-        print(f"❌ ENV ERROR: {name} դատարկ է")
-        sys.exit(1)
-    return v
+# Կարաս թողնես hardcode ինչպես հիմա, կամ տեղափոխես env-ի մեջ TELEGRAM_TOKEN / CHAT_ID
+bot_token = '8100566090:AAGky2qeO6yif0vDjnP7NX-AFZ07FEZgs6w'
+chat_id = '-1002794962661'
+bot = telebot.TeleBot(bot_token, parse_mode="HTML")
 
-BOT_TOKEN = getenv_strict("BOT_TOKEN")
-CHAT_ID   = getenv_strict("CHAT_ID")
-
-# օպցիոնալ՝ շտապ debug, առանց գաղտնիք բացելու
-print(f"ENV OK: BOT_TOKEN len={len(BOT_TOKEN)}, CHAT_ID set")
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
-chat_id = CHAT_ID
+# ========= Optional FX API key =========
+ALPHAVANTAGE_KEY = os.environ.get("ALPHAVANTAGE_KEY", "").strip()
 
 # ========= Runtime Config (editable via /set) =========
 CFG = {
-    # Markets
-    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "RPLUSDT"],   # /set symbols=BTCUSDT,ETHUSDT
+    # Markets (երկու աշխարհն էլ աջակցված է)
+    # Binance → "BTCUSDT" կամ "BINANCE:BTCUSDT"
+    # Forex   → "FX:EURUSD", "FX:GBPUSD", ...
+    "symbols": ["FX:EURUSD","FX:GBPUSD","FX:USDJPY","FX:USDCHF","FX:AUDUSD","FX:USDCAD","BINANCE:BTCUSDT"],
+
     "intervals": ["1m", "5m", "15m", "30m", "1h"],
 
     # Signal gating
@@ -61,7 +56,7 @@ CFG = {
     "agreement_needed": 2,      # need N of 3 indicators to align (EMA/MACD/RSI)
 
     # Cooldown / resend rules
-    "cooldown_sec": 10*60,      # minimal time between same key signals
+    "cooldown_sec": 10*60,       # minimal time between same key signals
     "min_price_move_pct": 0.003, # minimal relative move to resend same key
 
     # Check cadence
@@ -69,7 +64,7 @@ CFG = {
 
     # Volume (dynamic): current vol z-score vs last N bars mean/std
     "vol_window": 30,           # rolling window
-    "vol_z": 0.8,               # require z-score >= vol_z  (change via /set vol_z=1.0)
+    "vol_z": 0.8,               # require z-score >= vol_z
 
     # Volatility (dynamic): current TR vs rolling mean TR * multiplier
     "tr_window": 30,
@@ -101,10 +96,28 @@ def _init_state():
         signal_history[s]   = []
 _init_state()
 
+# ========= Utilities =========
+def _is_binance_symbol(sym: str) -> bool:
+    return (not sym.upper().startswith("FX:"))
+
+def _binance_clean(sym: str) -> str:
+    # accepts "BTCUSDT" or "BINANCE:BTCUSDT"
+    s = sym.upper()
+    return s.replace("BINANCE:", "")
+
+def _map_interval_for_fx(interval: str) -> str:
+    """
+    Alpha Vantage supports: 1min, 5min, 15min, 30min, 60min
+    Map "1h" -> "60min"
+    """
+    if interval == "1h":
+        return "60min"
+    return interval
+
 # ========= Binance fetch =========
 def fetch_binance_klines(symbol, interval, limit=200):
     url = "https://api.binance.com/api/v3/klines"
-    params = {'symbol': symbol, 'interval': interval, 'limit': limit}
+    params = {'symbol': _binance_clean(symbol), 'interval': interval, 'limit': limit}
     try:
         r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
@@ -125,6 +138,85 @@ def fetch_binance_klines(symbol, interval, limit=200):
     except Exception as e:
         print(f"[BINANCE ERR] {symbol} {interval}: {e}")
         return pd.DataFrame()
+
+# ========= FX fetch (Alpha Vantage) =========
+def fetch_fx_alphavantage(symbol, interval, limit=200):
+    """
+    symbol: "FX:EURUSD"
+    interval: one of 1m,5m,15m,30m,1h (1h -> 60min)
+    returns DataFrame columns [timestamp, open, high, low, close, volume]
+    """
+    if not ALPHAVANTAGE_KEY:
+        print(f"[FX SKIP] {symbol} → ALPHAVANTAGE_KEY not set. Skipping.")
+        return pd.DataFrame()
+
+    pair = symbol[3:]  # EURUSD
+    if len(pair) != 6:
+        print(f"[FX ERR] Bad pair format: {symbol}")
+        return pd.DataFrame()
+    from_sym = pair[:3]
+    to_sym   = pair[3:]
+
+    av_interval = _map_interval_for_fx(interval)  # '60min' mapping
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "FX_INTRADAY",
+        "from_symbol": from_sym,
+        "to_symbol": to_sym,
+        "interval": av_interval,
+        "outputsize": "compact",  # ~100 bars
+        "datatype": "json",
+        "apikey": ALPHAVANTAGE_KEY
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            print(f"[AV] {symbol} {interval} -> HTTP {r.status_code} {r.text[:200]}")
+            return pd.DataFrame()
+        data = r.json()
+        # Alpha Vantage returns something like: "Time Series FX (5min)": { "2025-08-01 10:35:00": {...}, ... }
+        ts_key = None
+        for k in data.keys():
+            if k.lower().startswith("time series fx"):
+                ts_key = k
+                break
+        if not ts_key or ts_key not in data:
+            # Could be rate-limited or error message
+            print(f"[AV] {symbol} {interval} -> No time series in response: {str(data)[:200]}")
+            return pd.DataFrame()
+
+        raw = data[ts_key]  # dict of timestamp -> dict
+        # build dataframe
+        records = []
+        for t, row in raw.items():
+            try:
+                records.append({
+                    "timestamp": pd.to_datetime(t, utc=True),
+                    "open": float(row.get("1. open", row.get("1. Open", 0.0))),
+                    "high": float(row.get("2. high", row.get("2. High", 0.0))),
+                    "low":  float(row.get("3. low",  row.get("3. Low", 0.0))),
+                    "close":float(row.get("4. close",row.get("4. Close", 0.0))),
+                    "volume": float(row.get("5. volume", 0.0)) if "5. volume" in row else 0.0
+                })
+            except Exception:
+                continue
+        if not records:
+            return pd.DataFrame()
+        df = pd.DataFrame(records).sort_values("timestamp")
+        # keep only last `limit` rows
+        if len(df) > limit:
+            df = df.iloc[-limit:]
+        return df[['timestamp','open','high','low','close','volume']]
+    except Exception as e:
+        print(f"[AV ERR] {symbol} {interval}: {e}")
+        return pd.DataFrame()
+
+# ========= Multiplexed fetch =========
+def fetch_klines(symbol, interval, limit=200):
+    if _is_binance_symbol(symbol):
+        return fetch_binance_klines(symbol, interval, limit)
+    else:
+        return fetch_fx_alphavantage(symbol, interval, limit)
 
 # ========= Indicators =========
 def compute_rsi(series, period):
@@ -156,18 +248,18 @@ def compute_indicators(df):
 def volume_ok(df):
     w = CFG["vol_window"]
     if len(df) < w + 5:  # need enough data
-        return True  # don’t block if not enough data
+        return True, np.nan  # don’t block if not enough data
     vol = df['volume']
     mu = vol.rolling(w).mean().iloc[-1]
     sd = vol.rolling(w).std().iloc[-1]
     if sd is None or sd == 0 or np.isnan(sd):
-        return True
+        return True, np.nan
     z = (vol.iloc[-1] - mu) / sd
-    return z >= CFG["vol_z"], z
+    return (z >= CFG["vol_z"]), z
 
 def tr_ok(df):
     w = CFG["tr_window"]
-    high = df['high']; low = df['low']; close = df['close']
+    high = df['high']; low = df['low']
     tr = (high - low).abs()
     if len(tr) < w + 5:
         return True, np.nan, np.nan
@@ -180,6 +272,7 @@ def tr_ok(df):
 # ========= Confidence =========
 def confidence_from_indicators(ema_fast, ema_slow, rsi, macd_line, signal_line, direction):
     w_trend, w_mom, w_rsi, w_cross = 0.40, 0.30, 0.15, 0.15
+
     trend_ok = (
         (ema_fast.iloc[-1] > ema_slow.iloc[-1] and ema_fast.iloc[-1] > ema_slow.iloc[-2] and direction == "Buy") or
         (ema_fast.iloc[-1] < ema_slow.iloc[-1] and ema_fast.iloc[-1] < ema_slow.iloc[-2] and direction == "Sell")
@@ -213,12 +306,12 @@ def analyze_symbol(symbol):
     best = {"dir": None, "price": None, "score": -1, "tf": None, "breakdown": None, "extras": {}}
 
     for tf in CFG["intervals"]:
-        df = fetch_binance_klines(symbol, tf, limit=max(200, CFG["chart_bars"]))
+        df = fetch_klines(symbol, tf, limit=max(200, CFG["chart_bars"]))
         if df.empty or len(df) < 50:
             continue
 
         ema_f, ema_s, rsi, macd_l, macd_s = compute_indicators(df)
-        price = df['close'].iloc[-1]
+        price = float(df['close'].iloc[-1])
 
         # direction
         buy  = (ema_f.iloc[-1] > ema_s.iloc[-1]) and (macd_l.iloc[-1] > macd_s.iloc[-1])
@@ -249,8 +342,8 @@ def analyze_symbol(symbol):
             continue
 
         # dynamic volume
-        vol_ok, vol_z = volume_ok(df)
-        if not vol_ok:
+        vol_ok_flag, vol_z = volume_ok(df)
+        if not vol_ok_flag:
             continue
 
         # dynamic volatility (true range vs rolling mean)
@@ -262,28 +355,21 @@ def analyze_symbol(symbol):
         score, breakdown = confidence_from_indicators(ema_f, ema_s, rsi, macd_l, macd_s, direction)
         if score > best["score"]:
             best.update({
-                "dir": direction, "price": float(price), "score": score, "tf": tf,
+                "dir": direction, "price": price, "score": score, "tf": tf,
                 "breakdown": breakdown,
                 "extras": {
-                    "vol_z": None if isinstance(vol_z, bool) else float(vol_z),
-                    "now_tr": None if now_tr is None or np.isnan(now_tr) else float(now_tr),
-                    "mean_tr": None if mean_tr is None or np.isnan(mean_tr) else float(mean_tr),
-                }
+                    "vol_z": None if isinstance(vol_z, bool) else (None if pd.isna(vol_z) else float(vol_z)),
+                    "now_tr": None if now_tr is None or pd.isna(now_tr) else float(now_tr),
+                    "mean_tr": None if mean_tr is None or pd.isna(mean_tr) else float(mean_tr),
+                },
+                "df": df.copy(),
+                "ema_f": ema_f,
+                "ema_s": ema_s,
             })
-            # attach df if best for chart
-            best["df"] = df.copy()
-            best["ema_f"] = ema_f
-            best["ema_s"] = ema_s
 
     return best
 
 # ========= Text & Chart =========
-def fmt_pct(x, digits=2):
-    try:
-        return f"{x*100:.{digits}f}%"
-    except:
-        return "n/a"
-
 def generate_signal_text(symbol, res):
     trend_s, mom_s, rsi_s, cross_s = res["breakdown"] if res["breakdown"] else (0,0,0,0)
     now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
@@ -328,7 +414,6 @@ def render_chart_and_get_bytes(df, ema_f, ema_s, symbol, price):
 
 # ========= Send logic =========
 def maybe_send_signal(symbol, res):
-    """Apply cooldown/min-move rules and send"""
     key = (res["dir"], res["tf"])
     now = time.time()
     info = last_signal_info[symbol]
@@ -345,7 +430,6 @@ def maybe_send_signal(symbol, res):
         within_cd = (now - info["ts"] < CFG["cooldown_sec"])
         small_move = (info["price"] is not None) and (abs(res["price"] - info["price"]) / info["price"] < CFG["min_price_move_pct"])
         if within_cd and small_move:
-            # skip
             return
 
     # update and send
@@ -353,7 +437,7 @@ def maybe_send_signal(symbol, res):
     text = generate_signal_text(symbol, res)
     bot.send_message(chat_id, text)
 
-    # store to history
+    # history (last 5)
     hist = signal_history[symbol]
     hist.append({
         "ts": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -428,7 +512,7 @@ def cmd_set(msg):
     """
     /set key=value [key=value ...]
     keys:
-      symbols=BTCUSDT,ETHUSDT
+      symbols=BTCUSDT,FX:EURUSD
       conf_min=80
       persist_bars=3
       agreement_needed=2
@@ -488,7 +572,7 @@ def welcome(msg):
                       "• /ping — ping/uptime\n"
                       "• /status — կոնֆիգ + վերջին սիգնալներ\n"
                       "• /set key=value [...] — փոխել կարգավորումներ\n"
-                      "Օրինակ՝ /set conf_min=80 vol_z=1.2 tr_mult=1.15 symbols=BTCUSDT,ETHUSDT,SOLUSDT")
+                      "Օրինակ՝ /set conf_min=80 vol_z=1.2 tr_mult=1.15 symbols=BTCUSDT,FX:EURUSD")
 
 # ========= Worker thread =========
 def start_checker_thread():
@@ -497,7 +581,6 @@ def start_checker_thread():
 
 # ========= Robust polling =========
 def start_polling_forever():
-    # long-polling self-healing loop
     while True:
         try:
             bot.polling(non_stop=True, interval=1, timeout=25, long_polling_timeout=30)
@@ -508,8 +591,8 @@ def start_polling_forever():
 # ========= Main =========
 if __name__ == "__main__":
     start_checker_thread()
-
     start_polling_forever()
+
 
 
 
